@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .evidence import EvidenceService
 from .service import DomainService
 from .storage import Database
 
@@ -48,6 +49,42 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        if method == "POST" and parsed.path == "/inspection-plans":
+            response = service.generate_plan(actor_id=actor_id, **body)
+            return 200 if response.get("replayed") else 201, response
+        if method == "GET" and parsed.path == "/inspection-plans":
+            query = parse_qs(parsed.query)
+            plan_id = query.get("plan_id", [None])[0]
+            site_id = query.get("site_id", [None])[0]
+            local_date = query.get("local_date", [None])[0]
+            return 200, service.get_plan(plan_id=plan_id, site_id=site_id, local_date=local_date)
+        if method == "POST" and parsed.path == "/inspection-evidence":
+            response = service.submit_evidence(actor_id=actor_id, **body)
+            if response.get("replayed") or response.get("deduplicated"):
+                return 200, response
+            return 201, response
+        if method == "POST" and parsed.path == "/inspection-corrections":
+            response = service.submit_correction(actor_id=actor_id, **body)
+            return 200 if response.get("replayed") else 201, response
+        if method == "POST" and parsed.path == "/inspection-disputes":
+            response = service.raise_dispute(actor_id=actor_id, **body)
+            return 200 if response.get("replayed") else 201, response
+        if method == "POST" and parsed.path == "/inspection-decisions":
+            response = service.decide_evidence(actor_id=actor_id, **body)
+            return 200 if response.get("replayed") else 201, response
+        if method == "GET" and parsed.path == "/inspection-day-report":
+            query = parse_qs(parsed.query)
+            site_id = query.get("site_id", [""])[0]
+            local_date = query.get("local_date", [""])[0]
+            if not site_id or not local_date:
+                raise ValidationError("site_id 与 local_date 不能为空")
+            return 200, service.day_report(site_id=site_id, local_date=local_date)
+        if method == "GET" and parsed.path == "/inspection-timeline":
+            query = parse_qs(parsed.query)
+            plan_id = query.get("plan_id", [""])[0]
+            if not plan_id:
+                raise ValidationError("plan_id 不能为空")
+            return 200, {"items": service.plan_timeline(plan_id)}
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -99,7 +136,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    Handler.service = EvidenceService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
