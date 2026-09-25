@@ -9,18 +9,21 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .inspection import InspectionService
 from .service import DomainService
 from .storage import Database
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          inspection: InspectionService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
+    inspection = inspection or InspectionService(service)
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
@@ -48,6 +51,32 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        if method == "POST" and parsed.path == "/inspections/checklists":
+            result = inspection.generate_checklist(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "POST" and parsed.path == "/inspections/evidence":
+            result = inspection.submit_evidence(actor_id=actor_id, **body)
+            return 200 if result["replayed"] or result["deduplicated"] else 201, result
+        if method == "POST" and parsed.path == "/inspections/corrections":
+            result = inspection.submit_correction(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "POST" and parsed.path == "/inspections/decisions":
+            result = inspection.record_decision(actor_id=actor_id, **body)
+            return 200 if result["replayed"] else 201, result
+        if method == "GET" and parsed.path == "/inspections/daily":
+            query = parse_qs(parsed.query)
+            site_id = query.get("site_id", [""])[0]
+            if not site_id:
+                raise ValidationError("site_id 不能为空")
+            local_date = query.get("date", [None])[0]
+            return 200, inspection.daily_report(site_id=site_id, local_date=local_date)
+        if method == "GET" and parsed.path == "/inspections/timeline":
+            query = parse_qs(parsed.query)
+            site_id = query.get("site_id", [""])[0]
+            local_date = query.get("date", [""])[0]
+            if not site_id or not local_date:
+                raise ValidationError("site_id 和 date 不能为空")
+            return 200, inspection.daily_timeline(site_id=site_id, local_date=local_date)
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -59,6 +88,7 @@ class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    inspection: InspectionService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +99,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                self.inspection)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +131,7 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.inspection = InspectionService(Handler.service)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
